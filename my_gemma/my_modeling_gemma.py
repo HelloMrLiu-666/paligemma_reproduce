@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 from my_configuration_gemma import my_GemmaConfig
 from my_cache_module import my_Cache
-
+from transformers import AutoTokenizer, GemmaForCausalLM
 
 
 class GemmaTextScaledWordEmbedding(nn.Embedding):
@@ -560,9 +560,8 @@ class my_GemmaForCausalLM(nn.Module):
         return attention_mask,position_ids
 
 
-if __name__ == "__main__":
-    from transformers import AutoTokenizer, GemmaForCausalLM
-
+def test():
+# if __name__ == "__main__":
     
     prompt = "What is your favorite condiment?"
     tokenizer = AutoTokenizer.from_pretrained("google/gemma-7b")
@@ -576,10 +575,9 @@ if __name__ == "__main__":
 
 #my model generation
     config=my_GemmaConfig()
+    my_model=my_GemmaForCausalLM(config)
 
-    with torch.device("meta"):
-        model = my_GemmaForCausalLM(config)
-    num_params = sum(p.numel() for p in model.parameters())
+    num_params = sum(p.numel() for p in my_model.parameters())
     print(f"Parameters: {num_params:,}")
     for dtype in [torch.float32, torch.float16, torch.bfloat16]:
         bytes_per_param = torch.tensor([], dtype=dtype).element_size()
@@ -589,9 +587,6 @@ if __name__ == "__main__":
         )
 
         print(dtype, f"{memory_gb:.2f} GB")
-
-
-    my_model=my_GemmaForCausalLM(config)
     #prepare the attention_mask
 
     # Generate
@@ -604,4 +599,4 @@ if __name__ == "__main__":
 
     #compare model output
     print(f'my_output_text:{my_output_text}')
-    print(f'hug_output_text:{hug_output_text}')
+    # print(f'hug_output_text:{hug_output_text}')
