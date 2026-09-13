@@ -575,7 +575,9 @@ def test():
 
 #my model generation
     config=my_GemmaConfig()
+    print("hahha")
     my_model=my_GemmaForCausalLM(config)
+    print("ee")
 
     num_params = sum(p.numel() for p in my_model.parameters())
     print(f"Parameters: {num_params:,}")
