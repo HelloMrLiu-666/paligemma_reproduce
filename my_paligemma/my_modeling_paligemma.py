@@ -1,8 +1,11 @@
 from dataclasses import dataclass
-
+from my_modeling_paligemma import PaliGemmaConfig
 import torch
 from torch import nn
 from my_utils import _sample_top_p
+from my_siglip.my_modeling_siglip import my_SiglipVisionModel
+from my_gemma.my_modeling_gemma import my_GemmaModel
+from my_gemma.my_cache_module import my_Cache
 
 
 class PaliGemmaMultiModalProjector(nn.Module):
@@ -78,7 +81,7 @@ class PaliGemmaModel(nn.Module):
         input_ids: torch.LongTensor,        #provided by prepare_inputs_for_generation
         attention_mask: torch.Tensor,       #provided by prepare_inputs_for_generation
         position_ids: torch.LongTensor,     #provided by prepare_inputs_for_generation
-        past_key_values: Cache,
+        past_key_values: my_Cache,
         pixel_values: torch.FloatTensor | None = None, #should allow None to decide if merge image feature to text
         # token_type_ids: torch.LongTensor | None = None,
         # inputs_embeds: torch.FloatTensor | None = None,
@@ -278,7 +281,7 @@ class PaliGemmaForConditionalGeneration(nn.Module):
                 past_key_values: my_Cache | None = None,
                 attention_mask: torch.LongTensor | None = None, #is the padding mask from the tokenizer
                 is_first_iteration: bool | None = False,
-            )
+            ):
 
         """
         

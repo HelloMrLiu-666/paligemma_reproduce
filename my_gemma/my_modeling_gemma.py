@@ -6,6 +6,16 @@ from my_cache_module import my_Cache
 from transformers import AutoTokenizer, GemmaForCausalLM
 
 
+#for benchmarking debugging 
+# import transformers.models.gemma.modeling_gemma as modeling_gemma
+# import transformers.generation.logits_process as logits_process
+import transformers.generation.utils as utils
+#this is for liu_guang debugging
+debug_values = {}
+debug_values["gen_step"] =0
+debug_values["deco_layer"] =0
+
+
 class GemmaTextScaledWordEmbedding(nn.Embedding):
     """
     This module overrides nn.Embeddings' forward by multiplying with embeddings scale.
@@ -23,6 +33,7 @@ class GemmaTextScaledWordEmbedding(nn.Embedding):
             input_emb:[batch, num_posi,emb_dim]
         """
         input_emb=self.embed_scale*(super().forward(input_ids))
+
         return input_emb
 
 
@@ -30,7 +41,7 @@ class GemmaRMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
         self.eps = eps
-        self.weight = nn.Parameter(data=torch.ones(*(1,1,dim),  dtype=torch.float32))
+        self.weight = nn.Parameter(data=torch.ones((dim),  dtype=torch.float32))
 
     def _norm(self, x):
         """
@@ -39,14 +50,14 @@ class GemmaRMSNorm(nn.Module):
         Returns:
             normalized:[batch, num_posi,1]
         """
-        x=x.power(2).mean(dim=-1, keepdim=True)#[batch, num_posi,emb_dim]->[batch, num_posi,1]
+        x=x.pow(2).mean(dim=-1, keepdim=True)#[batch, num_posi,emb_dim]->[batch, num_posi,1]
         normal_factor=torch.rsqrt(x+self.eps)#no shape change
         return normal_factor
 
     def forward(self, x):
-        with torch.autocast(device_type=x.device_type, enabled=False):
-            output = x*self._norm(x.float())#[batch, num_posi,emb_dim]*[batch, num_posi,1]->[batch, num_posi,emb_dim]
-            output = output*(1+self.weight)#[batch, num_posi,emb_dim]*[1, 1,emb_dim]->[batch, num_posi,emb_dim]
+        # with torch.autocast(device_type=x.device_type, enabled=False):
+        output = x*self._norm(x.float())#[batch, num_posi,emb_dim]*[batch, num_posi,1]->[batch, num_posi,emb_dim]
+        output = output*(1+self.weight)#[batch, num_posi,emb_dim]*[1, 1,emb_dim]->[batch, num_posi,emb_dim]
         return output.type_as(x)
 
 class GemmaMLP(nn.Module):
@@ -87,12 +98,12 @@ class GemmaRotaryEmbedding(nn.Module):
         Returns:
             torch.Tensor: (head_dim/2,)  containing the inverse frequencies for the RoPE embeddings 
         """
-        
         dim=config.hidden_size//config.num_attention_heads
-        #to device is not set for the tensor here, so the device need to be set within forward before operation with GPU tensor x
-        #otherwise the device should be desiged as a separate argument to pass through multiple functions to get to here
+
+        # #to device is not set for the tensor here, so the device need to be set within forward before operation with GPU tensor x
+        # #otherwise the device should be desiged as a separate argument to pass through multiple functions to get to here
         exponents=torch.arange(0,dim,2, dtype=torch.float)#even though looks like not the same as paper, the final range of the exponents is the same as the paper [0,dim-2]
-        theta=10000.0**(-exponents/dim.float())
+        theta=1.0/(10000.0**(exponents/float(dim)))
         return theta
 
 
@@ -100,21 +111,25 @@ class GemmaRotaryEmbedding(nn.Module):
         """
         Args:
             x: [batch,heads, num_posi,head_dim]
-            position_ids:(1,num_posi_1?)
+            position_ids:(b,num_posi_1?)
 
         Returns:
-            cos : [len=1?,head_dim]
-            sin : [len=1?,head_dim]
+            cos : [b,len=1?,head_dim]
+            sin : [b,len=1?,head_dim]
         """
         #my implementation is different to huggingface, I haven't include batch information in cos & sin
-        position_ids_sliced=(position_ids[0,:])[:,None]#(1,len=1?)->(len=1?,)->(len=1?,1)
-        theta=(self.inv_freq)[None,:].to(device=x.device)#(head_dim/2,)->(1,head_dim/2)
+        position_ids_expanded=position_ids[:,None,:].float()#(b,num_posi_1?)->(b,1,num_posi_1?)
+        #(head_dim/2,)->(1,head_dim/2,1)->(b,head_dim/2,1)
+        theta=(self.inv_freq)[None,:,None].expand(position_ids_expanded.shape[0],-1,1).float().to(device=x.device)
+
         with torch.autocast(device_type=x.device.type, enabled=False):
-            m_theta=torch.matmul(position_ids_sliced.float(), theta.float())#(len=1?,1)@(1,head_dim/2)->(len=1?,head_dim/2)
+            #(b,head_dim/2,1)@(b,1,num_posi_1?)->(b,head_dim/2,num_posi_1?)->(b,num_posi_1?,head_dim/2)
+            m_theta=(theta@position_ids_expanded).transpose(1,2)
             cos=torch.cos(m_theta)
             sin=torch.sin(m_theta)
-            cos=torch.cat((cos, cos), dim=1)#(len=1?,head_dim/2)->(len=1?,head_dim)
-            sin=torch.cat((sin, sin), dim=1)
+            cos=torch.cat((cos, cos), dim=-1)#(b,len=1?,head_dim/2)->(b,len=1?,head_dim)
+            sin=torch.cat((sin, sin), dim=-1)
+
         return cos.type_as(x),sin.type_as(x)
 
 def rotate_half(x):
@@ -127,8 +142,7 @@ def rotate_half(x):
     """
     _,_,_,head_dim=x.shape
     x1=x[...,:head_dim//2]
-    x2=-x[...,head_dim//2:]
-
+    x2=x[...,head_dim//2:]
     return torch.cat((-x2, x1), dim=-1)
 
 
@@ -138,8 +152,8 @@ def apply_rotary_pos_emb(q, k, cos, sin):
     Args:
         q (`torch.Tensor`): (batch,heads, len=1?,head_dim)
         k (`torch.Tensor`): (batch,heads, len=1?,head_dim)
-        cos (`torch.Tensor`): (len=1?,head_dim)
-        sin (`torch.Tensor`): (len=1?,head_dim)
+        cos (`torch.Tensor`): (b,len=1?,head_dim)
+        sin (`torch.Tensor`): (b,len=1?,head_dim)
         unsqueeze_dim (`int`, *optional*, defaults to 1):
     Returns:
         q_embed: (batch,heads, len=1?,head_dim)
@@ -147,8 +161,8 @@ def apply_rotary_pos_emb(q, k, cos, sin):
     """
     q_rotate_half=rotate_half(q)
     k_rotate_half=rotate_half(k)    #(batch,heads, len=1?,head_dim)
-    cos=cos[None,None,:,:]#(len=1?,head_dim)->(1,1,len=1?,head_dim)
-    sin=sin[None,None,:,:]
+    cos=cos[:,None,:,:]#(b,len=1?,head_dim)->(b,1,len=1?,head_dim)
+    sin=sin[:,None,:,:]
     q_embed=(q*cos)+(rotate_half(q)*sin)
     k_embed=(k*cos)+(rotate_half(k)*sin)
     return q_embed, k_embed
@@ -191,18 +205,24 @@ def eager_attention_forward(
     n_rep=module.num_key_value_groups
     key_states=repeat_kv(key,n_rep )
     value_states=repeat_kv(value, n_rep)
+
+    #to align with huggingface implementation, convert the bool type mask to tensor with 0 and -inf
+    min_dtype = torch.finfo(torch.float32).min
+    mask =torch.zeros_like(attention_mask, dtype=torch.float32)
+    mask = mask.masked_fill(~attention_mask, min_dtype)
+
     #(batch,att_heads,num_posi_query,head_dim)@(batch,att_heads,head_dim,num_posi_key)->(batch,att_heads,num_posi_query,num_posi_key)
     attn_weights=torch.matmul(query, key_states.transpose(2, 3))*scaling
     if not attention_mask is None:
-        attn_weights=attn_weights+attention_mask
+        attn_weights=attn_weights+mask
 
     with torch.autocast(device_type=query.device.type, enabled=False):
         attn_weights=nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32)
     attn_weights=attn_weights.to(query.dtype)#only the softmax is calculated as float32, other matrix multiplication might in lower precision
     attn_weights=nn.functional.dropout(attn_weights, p=dropout, training=module.training)
     #(batch,att_heads,num_posi_query,num_posi_key)@(batch,att_heads,num_posi_key,head_dim)->(batch,att_heads,num_posi_query,head_dim)
-    attn_output=torch.matmul(attn_weights, value_states)
-
+    #(batch,att_heads,num_posi_query,head_dim)->(batch,num_posi_query,att_heads,head_dim)
+    attn_output=torch.matmul(attn_weights, value_states).transpose(1,2)
     return attn_output, attn_weights
 
 
@@ -240,6 +260,7 @@ class GemmaAttention(nn.Module):
             attn_output: (batch,num_posi_1?,hidden_size) ,num_posi_query is num_posi_1?
             attn_weights:(batch,att_heads,num_posi_query,num_posi_key)
         """
+
         q=self.q_proj(hidden_states)#(batch,num_posi_1?,emb_dim)->(batch,num_posi_1?,num_att_heads*head_dim)
         k=self.k_proj(hidden_states)#(batch,num_posi_1?,emb_dim)->(batch,num_posi_1?,num_kv_heads*head_dim)
         v=self.v_proj(hidden_states)#(batch,num_posi_1?,emb_dim)->(batch,num_posi_1?,num_kv_heads*head_dim)
@@ -251,18 +272,16 @@ class GemmaAttention(nn.Module):
         q_states=q.view(hidden_shape).transpose(1,2)
         k_states=k.view(hidden_shape).transpose(1,2)#(batch,num_kv_heads,num_posi_1?,head_dim)
         v_states=v.view(hidden_shape).transpose(1,2)#(batch,num_kv_heads,num_posi_1?,head_dim)
+
     #apply the position embedding before the store/get info into/from kv cache
         cos, sin= position_embeddings#[num_posi_1?,head_dim]
         q_states,k_states=apply_rotary_pos_emb(q_states, k_states, cos, sin)#no shape change for q k
 
     #store/get info into/from kv cache
-        if past_key_values.get_seq_length() > 0:#(batch,num_kv_heads,num_posi_1?,head_dim)->(batch,num_kv_heads,num_posi,head_dim)
-            k_states, v_states=past_key_values.update(k_states, v_states, self.layer_idx)
+        #(batch,num_kv_heads,num_posi_1?,head_dim)->(batch,num_kv_heads,num_posi,head_dim)
+        k_states, v_states=past_key_values.update(k_states, v_states, self.layer_idx)
 
     #align the heads
-        k_states=repeat_kv(k_states,self.num_key_value_groups)
-        v_states=repeat_kv(v_states,self.num_key_value_groups)
-
         attn_output, attn_weights=eager_attention_forward(#no shape change for q_state (batch,num_att_heads,num_posi_1?,head_dim)
             module=self,
             query=q_states,
@@ -271,8 +290,9 @@ class GemmaAttention(nn.Module):
             attention_mask=attention_mask,
             scaling=self.scaling,
             dropout=self.attention_dropout)
-        #(batch,num_att_heads,num_posi_1?,head_dim)->(batch,num_posi_1?,num_att_heads,head_dim)->(batch,num_posi_1?,num_att_heads*head_dim)
-        attn_output=attn_output.transpose(1,2).contiguous().view(*shape,-1)
+
+        #(batch,num_posi_1?,num_att_heads,head_dim)->(batch,num_posi_1?,num_att_heads*head_dim)
+        attn_output=attn_output.contiguous().view(*shape,-1)
         #(batch,num_posi_1?,num_att_heads*head_dim)->(batch,num_posi_1?,hidden_size)
         attn_output=self.o_proj(attn_output)
 
@@ -302,7 +322,9 @@ class GemmaDecoderLayer(nn.Module):
 
         residual=hidden_states
         hidden_states=self.input_layernorm(hidden_states)
+
         hidden_states,_=self.self_attn(hidden_states,position_embeddings,attention_mask,past_key_values)
+
         hidden_states=hidden_states+residual
 
         residual=hidden_states
@@ -358,21 +380,34 @@ class my_GemmaModel(nn.Module):
         else:#gemma model could be used by paligemma,which produce it own embedding with image info
             embeds=inputs_embeds
 
-
         #use the position_id to generate position_embeddings->(cos, sin)
         position_embeddings=self.rotary_emb(embeds, position_ids)
-
         hidden_states=embeds
+
+
+
+        # cast it to Boolean tensor
+        attention_mask=attention_mask.type('torch.BoolTensor')
+
+# #for benchmarking debugging, for multiple inference/generation steps, each step have different mask
+#         debug_values["gen_step"]+=1     
+#         #for benchmarking debugging 
+#         if (debug_values["gen_step"]-1)==modeling_gemma.debug_values["gen_step_to_check"]:
+#             # debug_values["debugging"] =(attention_mask.detach().clone()) #hidden_dim.detach().clone() 
+#             if (debug_values["gen_step"]-1)>0:
+#                 #(batch,num_kv_heads,num_posi_1?,head_dim)->(new_dimension, batch,num_kv_heads,num_posi_1?,head_dim)
+#                 constructured_keys=torch.stack([layer_i[0] for layer_i in past_key_values.layers], dim=0)
+#                 constructured_values=torch.stack([layer_i[1] for layer_i in past_key_values.layers], dim=0)
+#                 debug_values["debugging"] =(constructured_keys.detach().clone()) #hidden_dim.detach().clone() 
 
         for layer in self.layers:
             hidden_states=layer(
                 hidden_states,
                 attention_mask,
-                position_ids,
                 past_key_values,
                 position_embeddings
             )
-        
+
         hidden_states=self.norm(hidden_states)#no shape change\
         last_hidden_state=hidden_states
 
@@ -383,6 +418,7 @@ class my_GemmaModel(nn.Module):
 class my_GemmaForCausalLM(nn.Module):
     def __init__(self, config):
         super().__init__()
+        self.config=config
         self.model = my_GemmaModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, self.vocab_size, bias=False)
@@ -407,26 +443,11 @@ class my_GemmaForCausalLM(nn.Module):
         Returns:
             logits: (batch, num_posi_1?,vocab)
         """
+        hidden_states=self.model(input_ids,attention_mask,position_ids,past_key_values)#[0]
 
-        r"""
-        Example:
+        #align with huggingface implementation, only compute the logits of last position
+        logits=self.lm_head(hidden_states[:,-1:,:])#(batch, num_posi=1,emb_dim)->(batch, num_posi=1,vocab)
 
-        ```python
-        >>> from transformers import AutoTokenizer, GemmaForCausalLM
-
-        >>> model = GemmaForCausalLM.from_pretrained("google/gemma-7b")
-        >>> tokenizer = AutoTokenizer.from_pretrained("google/gemma-7b")
-
-        >>> prompt = "What is your favorite condiment?"
-        >>> inputs = tokenizer(prompt, return_tensors="pt")
-
-        >>> # Generate
-        >>> generate_ids = model.generate(inputs.input_ids, max_length=30)
-        >>> tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
-        "What is your favorite condiment?"
-        ```"""
-        hidden_states=self.model(input_ids,attention_mask,past_key_values)[0]
-        logits=self.lm_head(hidden_states)#(batch, num_posi_1?,emb_dim)->(batch, num_posi_1?,vocab)
         return logits
 
     #essentiallly, huggingface implementation, the generation logic inherits from GenerationMxin class into PaliGemmaForConditionalGeneration
@@ -436,7 +457,7 @@ class my_GemmaForCausalLM(nn.Module):
     def generate( #the input of this function is the output of PaligemmaProcessor
         self,
         input_ids: torch.LongTensor, 
-        attention_mask: torch.Tensor, #is the padding mask from the tokenizer
+        attention_mask: torch.Tensor = None, #is the padding mask from the tokenizer
         # pixel_values: torch.FloatTensor, #specific to paligemma input, no need for gemma
         generation_len: int | None = None,
         top_p: float=0.9):
@@ -454,19 +475,19 @@ class my_GemmaForCausalLM(nn.Module):
             #setting if it's the prefilling step, and initialize output_ids
             if i ==0:
                 is_first_iteration=True
+                past_key_values.is_first_iteration=is_first_iteration
                 #initialize a padding tensor of shape (b,generation_len)
                 generated_ids=torch.full((input_ids.shape[0],generation_len), pad_token_id, dtype=input_ids.dtype,device=input_ids.device)
             else:
                 is_first_iteration=False
+                past_key_values.is_first_iteration=is_first_iteration
 
             #each generation step, updates the attention_mask,position_ids 
-            attention_mask,position_ids=self.prepare_inputs_for_generation(#the returned mask is the paligemma specific mask
+            attention_mask,position_ids=prepare_inputs_for_generation(#the returned mask is the paligemma specific mask
                 input_ids,
                 past_key_values,
                 attention_mask,#is the padding mask from the tokenizer
                 is_first_iteration)
-
-
 
             # logits=self.forward(  #this is for paligemma specific generation function
             #     input_ids, 
@@ -480,126 +501,219 @@ class my_GemmaForCausalLM(nn.Module):
                 attention_mask,
                 position_ids,
                 past_key_values)
+            
+
+
+
 
         #from logits to id in vocab, and update to the input_ids
-            with torch.autocast(device_type=input_ids.device_type, enabled=False):
-                #(batch, num_posi1?,vocab_size) no shape change
-                output_probs=nn.functional.softmax(logits, dim=-1, dtype=torch.float32)
-            #(batch, num_posi1?,vocab_size)->(batch, num_posi1?)
-            next_token_id=self.my_sample_top_p(output_probs,top_p)
+            #(batch, num_posi=1,vocab_size)->(batch, num_posi=1,1)
+            next_token_id=self.my_sample_top_p(logits,top_p)
             #update the input_ids to prepare it for the auto-regressive generation
-            input_ids=next_token_id
+            #[:,-1,:] is to slice last predicted token, for the first step prefilling it's obvious
+            #but the auto regressive generation step also needed because the output
+            #shape would be (batch, 1,1), still need the slicing to make it 2 dimensional
+            input_ids=next_token_id[:,-1,:] 
             #fill the next_token_id to generated_ids ,(b,generation_len), (batch, num_posi1?)
-            generated_ids[:,i]=next_token_id
+            generated_ids[:,i]=next_token_id[:,-1,:] 
 
         return generated_ids
 
             
-    def my_sample_top_p(probs, p):# (b,seq,vocab)->(b,seq,1)
-        b,s,v=probs.shape
-        # g_enerator = torch.Generator(device=probs.get_device())
-        probs, indices=torch.sort(probs, dim=-1, descending=True)# indices are the index in unsorted probs
-        probs_sum=torch.cumsum(probs, dim=-1) #(b,seq,vocab)
-        mask=probs_sum-probs >p
-        #keep the top P
-        probs[mask]=0.0 #utilizing the boolean indexing
-        #normalize the top P
-        probs=probs/torch.sum(probs, dim=-1, keepdim=True)#(b,seq,vocab)/(b,seq,1)->(b,seq,vocab)
+    def my_sample_top_p(self,logits, p):# (b,seq,vocab)->(b,seq,1)
+        b,s,v=logits.shape
+
+        #sort, (b,seq,vocab), no shape change
+        sorted_logits, sorted_indices = torch.sort(logits, dim=-1, descending=False)
+        #softmax and cumsum, no shape change
+        cumulative_probs =nn.functional.softmax(sorted_logits, dim=-1, dtype=torch.float32).cumsum(dim=-1)
+        # bool mask to the sorted posiitons (True means to -inf i.e. remove)
+        sorted_indices_to_remove =(cumulative_probs<=(1-p))
+        sorted_indices_to_remove[:,:,-1:]=False # Keep at least 1 lefted indice
+
+        # transfer the sorted_indices_to_remove, to the unsorted/original bool mask(indices_to_remove);
+        # the connection of them are the sorted_indices
+        # whose matrix index position is corresponding to the index position of sorted_indices_to_remove
+        # whose value corresponding to the indices_to_remove's index position along vocabulary dimension
+        true_tensor = torch.ones(sorted_logits.shape, dtype=torch.bool)
+        indices_to_remove =true_tensor.scatter(-1, sorted_indices, sorted_indices_to_remove)
+
+        #mask_fill the remove position to be -inf
+        scores_processed =logits.masked_fill_(indices_to_remove, value=-float("inf"))
+
+    #for benchmarking debugging
+        g_cpu = torch.Generator(device='cpu')
+        g_cpu.manual_seed(42)
+
+        probs =nn.functional.softmax(scores_processed, dim=-1, dtype=torch.float32)
         #sample from the top P, recent version pytorch support 3D input tensor for multinomial, the last dim is the sampling dim
         probs=probs.view(-1,v)
-        probs_index=torch.multinomial(probs, num_samples=1, generator=None)#(b*seq,vocab)->index (b*seq,1) 
-        probs_index=probs_index.view(b,s,1)#the multinomial is sandwiched because multinomial support upto 2D
-        
-        next_token=torch.gather(indices, dim=-1,index=probs_index)#(b,seq,vocab),index (b,seq,1) ->(b,seq,1)
+        #after debugging, need to remove  the generator
+        probs_index=torch.multinomial(probs, num_samples=1,generator=g_cpu)#(b*seq,vocab)->index (b*seq,1) 
+        next_token=probs_index.view(b,s,1)#the multinomial is sandwiched because multinomial support upto 2D
+
+    # #for benchmarking debugging, for multiple inference/generation steps, each step have different mask
+    #     debug_values["gen_step"]+=1     
+    #     #for benchmarking debugging 
+    #     if (debug_values["gen_step"]-1)==utils.debug_values["gen_step_to_check"]:
+    #         debug_values["debugging"] =(probs.detach().clone()) #hidden_dim.detach().clone() 
+
         return next_token
 
-    def prepare_inputs_for_generation(
-                self,
-                input_ids: torch.LongTensor,
-                # next_sequence_length: int | None = None,
-                past_key_values: my_Cache | None = None,
-                attention_mask: torch.LongTensor | None = None, #is the padding mask from the tokenizer
-                is_first_iteration: bool | None = False,
-            ):
-        """
-        
-        Prepare the model inputs for generation. Notable steps include selecting the correct input key and cloning when appropriate,
-        creating position_ids from the attention_mask when missing, slicing inputs and converting 2D attention masks to 4D for
-        compilable caches, and finally forwarding all additional keyword arguments unchanged to the model's forward pass.
-
-        See the forward pass in the model documentation for expected arguments (different models might have different
-        requirements for e.g. `past_key_values`). This function should work as is for most LLMs.
-        
-        Args:
-            input_ids:(batch, num_posi1?)
-        Returns:
-            attention_mask:(batch,num_posi1?, num_posi)
-            position_ids:(1, num_posi1?)
-        """
-        batch,q_len,_=input_ids.shape
-        # position_ids
-        if is_first_iteration:
-            position_ids=torch.arange(start=0, end=input_ids.shape[1], dtype=torch.Long, device=input_ids.device)
-            position_ids=position_ids[None,:]#(num_posi_1?,)->(1,num_posi_1?)
-        else:
-            #prepare the position_id
-            old_len=past_key_values.get_seq_length(layer_idx=0)#before/after decoding layer operation, all layer should have same seq_len
-            new_len_1=q_len
-            position_ids=torch.arange(start=old_len, end=old_len+new_len_1, dtype=torch.Long, device=input_ids.device)
-            position_ids=position_ids[None,:]#(num_posi_1?,)->(1,num_posi_1?)
-        position_ids=position_ids+1#in Paligemma are 1-indexed
-
-        # Create the mask, only works for no padding existed in the input_ids
-        if is_first_iteration:
-            attention_mask=torch.full((batch,q_len,q_len), 0.0, dtype=self.lm_head.dtype,device=input_ids.device)
-        else:
-            assert q_len == 1
-            kv_len =past_key_values.get_seq_length(layer_idx=0) + q_len
-            attention_mask=torch.full((batch,q_len,kv_len), 0.0, dtype=self.lm_head.dtype,device=input_ids.device)
-
-        return attention_mask,position_ids
-
-
-def test():
-# if __name__ == "__main__":
+def prepare_inputs_for_generation(
+            input_ids: torch.LongTensor,
+            # next_sequence_length: int | None = None,
+            past_key_values: my_Cache | None = None,
+            attention_mask: torch.LongTensor | None = None, #is the padding mask from the tokenizer
+            is_first_iteration: bool | None = False,
+        ):
+    """
     
-    prompt = "What is your favorite condiment?"
-    tokenizer = AutoTokenizer.from_pretrained("google/gemma-7b")
-    inputs = tokenizer(prompt, return_tensors="pt")
+    Prepare the model inputs for generation. Notable steps include selecting the correct input key and cloning when appropriate,
+    creating position_ids from the attention_mask when missing, slicing inputs and converting 2D attention masks to 4D for
+    compilable caches, and finally forwarding all additional keyword arguments unchanged to the model's forward pass.
 
-#huggingface model generation
-    # hug_model = GemmaForCausalLM.from_pretrained("google/gemma-7b")
-    # # Generate
-    # hug_generate_ids = hug_model.generate(inputs.input_ids, max_length=30)
-    # hug_output_text=tokenizer.batch_decode(hug_generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
+    See the forward pass in the model documentation for expected arguments (different models might have different
+    requirements for e.g. `past_key_values`). This function should work as is for most LLMs.
+    
+    Args:
+        input_ids:(batch, num_posi1?)
+    Returns:
+        attention_mask:(batch,att_heads,num_posi_query?1,num_posi_key)
+        position_ids:(b, num_posi1?)
+    """
+    batch,q_len=input_ids.shape
+    # position_ids, following is to mimic the huggingface model position_id generation
+    if is_first_iteration:
+        position_ids = attention_mask.long().cumsum(-1) - 1#same shape as the attention_mask:(batch,num_posi1?)
+        # We need this as otherwise padding tokens appear as -1 in position
+        position_ids = position_ids.masked_fill(attention_mask == 0, 0)#(batch,num_posi>1)
+        #(batch,num_posi1?)->(batch,1)
+        past_key_values.set_cache_position(position_ids)
+    else:
+        position_ids=past_key_values.get_cache_position()#(batch,num_posi=1)
+    position_ids=position_ids#+1#in Paligemma are 1-indexed
 
-#my model generation
-    config=my_GemmaConfig()
-    print("hahha")
-    with torch.device('meta'):   
-        my_model=my_GemmaForCausalLM(config)
-    print("ee")
 
-    num_params = sum(p.numel() for p in my_model.parameters())
-    print(f"Parameters: {num_params:,}")
-    for dtype in [torch.float32, torch.float16, torch.bfloat16]:
-        bytes_per_param = torch.tensor([], dtype=dtype).element_size()
+    # Create the mask, is to mimic the create_causal_mask function of huggingface GemmaModel class
+    if is_first_iteration:#the shape should be 
+        b,positions=attention_mask.shape
+        whole_matrix=torch.zeros([b,positions, positions], dtype=torch.int16)#whole faulse matrix
+        no_pad_count=torch.sum(attention_mask, dim=-1, keepdim=False)#(batch,num_posi1?)->(batch,)
+        for count in no_pad_count:
+            i=0
+            corner_matrix=torch.ones([count, count], dtype=torch.int16)
+            corner_matrix=torch.tril(corner_matrix, diagonal=0)#
+            whole_matrix[i,positions-count:,positions-count:]=corner_matrix[:,:]
+            i+=1
+        causal_mask=whole_matrix
+        #[b,positions_q, positions_v]->(b,heads=1,num_query,num_key)
+        causal_mask=whole_matrix[:,None,:,:]
+        #(b,heads=1,num_query,num_key)->(b,heads=1,num_query=1,num_key)
+        past_key_values.set_cache_mask(causal_mask)
+    else:
+        causal_mask=past_key_values.update_cache_gen_mask()
 
-        memory_gb = (
-            num_params * bytes_per_param / 1024**3
-        )
 
-        print(dtype, f"{memory_gb:.2f} GB")
-    #prepare the attention_mask
 
-    # Generate
-    my_generated_ids=my_model.generate( 
-            inputs.input_ids, 
-            None, #to simplify the implementation, assuming that no padding(attention mask) included
-            generation_len= 1,
-            top_p=0.9)
-    my_output_text=tokenizer.batch_decode(my_generated_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
 
-    #compare model output
-    print(f'my_output_text:{my_output_text}')
-    # print(f'hug_output_text:{hug_output_text}')
+
+    # # Create the mask, only works for no padding existed in the input_ids
+    # if is_first_iteration:
+    #     attention_mask=torch.full((batch,q_len,q_len), 0.0, dtype=torch.int16,device=input_ids.device)
+    # else:
+    #     assert q_len == 1
+    #     kv_len =past_key_values.get_seq_length(layer_idx=0) + q_len
+    #     attention_mask=torch.full((batch,q_len,kv_len), 0.0, dtype=torch.int16,device=input_ids.device)
+
+    return causal_mask,position_ids
+
+
+
+# if __name__ == "__main__":
+
+# #huggingface GemmaModel initialization
+#     if debug_values["gen_step"]==0:
+#         print("why?")
+#     from transformers import AutoConfig, GemmaForCausalLM
+#     model_id = "google/paligemma-3b-pt-224"
+#     # 1. Fetch the full PaliGemma configuration
+#     config = AutoConfig.from_pretrained(model_id)
+#     # 2. Instantiate the Gemma language model using PaliGemma's text_config
+#     #load barebones backbone (hidden states only):
+#     hug_model = GemmaForCausalLM.from_pretrained(
+#         model_id, 
+#         config=config.text_config,
+#         attn_implementation="eager",
+#     )
+
+# #my_GemmaModel initialization
+#     config=my_GemmaConfig()
+#     my_model=my_GemmaForCausalLM(config)
+#     # copy values from pretrained model to my model
+#     for my_key, my_value in my_model.state_dict().items():
+#         match_tuple=[(hug_key, hug_param) for (hug_key, hug_param) in hug_model.state_dict().items() if my_key in hug_key]
+#         match_key,match_value=match_tuple[0]
+#         with torch.no_grad():
+#             my_value.copy_(match_value)
+#     # double check if copy successful torch.equal(torch.tensor([1, 2]), torch.tensor([1, 2]))
+#     for my_key, my_value in my_model.state_dict().items():
+#         match_tuple=[(hug_key, hug_param) for (hug_key, hug_param) in hug_model.state_dict().items() if my_key in hug_key]
+#         match_key,match_value=match_tuple[0]
+#         if not torch.equal(match_value,my_value):
+#             print(my_value)
+#             print(match_value)
+#         assert torch.equal(match_value,my_value),f"{my_key}&{match_key} is not identical, the shape is {match_value.dim()}VS{my_value.dim()}"
+
+# #prepare the inputs arguments for the model forward function
+#     from transformers import AutoTokenizer
+#     tokenizer = AutoTokenizer.from_pretrained("google/gemma-7b")
+#     prompt = "What is your favorite condiment?"
+#     inputs = tokenizer(prompt, return_tensors="pt",padding="max_length",max_length=20)
+#     input_ids=inputs.input_ids
+
+
+
+# #run hg_model forward
+#     hug_generate_ids = hug_model.generate(
+#         input_ids, 
+#         attention_mask=inputs.attention_mask,
+#         max_length=23,
+#         do_sample=True,
+#         top_p=0.9,
+#         top_k=0)
+    
+
+# #run my_model forward
+#     hug_generate_ids=my_model.generate(
+#         input_ids, 
+#         attention_mask=inputs.attention_mask,
+#         generation_len=23,
+#         top_p=0.9)    
+
+
+#     hg_tensor=utils.debug_values["debugging"]
+#     my_tensor=debug_values["debugging"]
+#     #check the value equality
+#     print(f'value equality check________________________')
+#     print(f'huggface:{hg_tensor}')
+#     print(f'my_model:{my_tensor}')
+#     bool_equal=torch.eq(hg_tensor, my_tensor)
+#     print(bool_equal)
+#     print(torch.all(bool_equal))  #for debugging 
+   
+#     # print the differences
+#     # diff = (hg_tensor - my_tensor).abs()
+#     # print(
+#     #     f'max={diff.max().item():.8e}, '
+#     #     f'mean={diff.mean().item():.8e}, '
+#     # )
+
+#     #check the shape equality
+#     print(f'shape equality check________________________')
+#     print(f'huggface:{hg_tensor.shape}')
+#     print(f'my_model:{my_tensor.shape}')
+
+
+
+
